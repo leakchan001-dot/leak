@@ -795,7 +795,7 @@
   <section id="health">
     <div class="section-head">
       <h2>Stock health</h2>
-      <p>Every SKU falls into exactly one state, checked in order: negative, then zero, then moved this period, then idle.</p>
+      <p id="health-head-sub">Every SKU falls into exactly one state, checked in order: negative, then zero, then moved this period, then idle.</p>
     </div>
     <div class="grid-2">
       <div class="chart-card">
@@ -804,7 +804,7 @@
         <div id="health-list"></div>
       </div>
       <div class="chart-card">
-        <div class="chart-head"><span class="chart-title">Deepest negative balances</span></div>
+        <div class="chart-head"><span class="chart-title" id="title-negative">Deepest negative balances</span></div>
         <p class="chart-sub" id="sub-negative"></p>
         <div class="table-wrap scroll-y" id="tbl-negative"></div>
       </div>
@@ -821,7 +821,7 @@
   <section id="inventory">
     <div class="section-head">
       <h2>Inventory ledger</h2>
-      <p>Opening balance, movements and closing balance for every SKU. Search by code or description; click a column to sort.</p>
+      <p id="inventory-head-sub">Opening balance, movements and closing balance for every SKU. Search by code or description; click a column to sort.</p>
     </div>
     <div class="card">
       <div class="controls">
@@ -831,6 +831,8 @@
         <button class="chip" data-filter="negative" aria-pressed="false"><span class="status-dot dot-critical"></span>Negative</button>
         <button class="chip" data-filter="out_of_stock" aria-pressed="false"><span class="status-dot dot-warning"></span>Zero</button>
         <button class="chip" data-filter="idle" aria-pressed="false">Idle</button>
+        <button class="chip" data-filter="uncounted" id="chip-uncounted" aria-pressed="false" hidden>
+          <span class="status-dot dot-serious"></span>Not counted</button>
         <span class="count-note" id="row-count"></span>
       </div>
       <div class="table-wrap scroll-y" id="tbl-inventory"></div>
@@ -858,6 +860,10 @@
   // the Storage Area Map further down; this sheet is read only to check that
   // the two still name the same racks.
   const PLAN_SHEET = "STORAGE AREA";
+
+  // Receipts above five million units are a unit mix-up, not a delivery: film
+  // and sheet stock booked in by the metre and issued by the piece.
+  const OUTLIER_THRESHOLD = 5000000;
 
   /* What is left on the shelf is counted in a second workbook — the Final
      Stock Report, which closes the month on its own — and matched to these
@@ -905,21 +911,63 @@
     });
   }
 
+  const stateOf = (balance, issued) =>
+    balance < 0 ? "negative"
+    : balance === 0 ? "out_of_stock"
+    : issued > 0 ? "moving" : "idle";
+
   // Reassigned when the reader below parses a newer workbook, so everything
   // that draws must read DATA at call time rather than capturing it.
   let DATA = derive(JSON.parse($("dashboard-data").textContent));
 
   // Three views of the same SKU list, derived here rather than shipped as
   // three more copies of it in the payload.
-  const DERIVED = ["top_movers", "negative_stock", "outliers"];
+  const DERIVED = ["top_movers", "negative_stock", "uncounted_stock", "outliers"];
 
   function derive(data) {
     applyOnHand(data);
+    rateItems(data);
     const byDesc = (key) => (a, b) => b[key] - a[key];
     data.top_movers = data.items.filter((i) => i.stock_out > 0).sort(byDesc("stock_out")).slice(0, 10);
-    data.negative_stock = data.items.filter((i) => i.status === "negative").sort((a, b) => a.remaining - b.remaining);
-    data.outliers = data.items.filter((i) => i.outlier).sort(byDesc("remaining"));
+    data.negative_stock = data.items.filter((i) => i.status === "negative")
+      .sort((a, b) => a.balance - b.balance);
+    data.uncounted_stock = data.items.filter((i) => i.status === "uncounted")
+      .sort((a, b) => a.remaining - b.remaining);
+    data.outliers = data.items.filter((i) => i.outlier).sort(byDesc("stock_in"));
     return data;
+  }
+
+  /* What is on the shelf, and the state that follows from it.
+
+     The count report is the authority here. The ledger's own closing balance
+     is a running total of movements, and where issues were booked against
+     receipts nobody entered it runs below zero — 74 SKUs did, not one of
+     which the October count found short. So the count sets the balance and
+     the state, and an item the count sheet has no line for is reported as
+     exactly that rather than given the ledger's figure by default.
+
+     Without a count workbook the ledger is all there is, and it is used. */
+  function rateItems(data) {
+    const counting = !!(data.on_hand && data.on_hand.file && !data.on_hand.error);
+    data.items.forEach((i) => {
+      const found = i.on_hand_pcs !== null && i.on_hand_pcs !== undefined;
+      i.counted = counting && found;
+      i.balance = counting ? (found ? i.on_hand_pcs : null) : i.remaining;
+      i.status = i.counted ? stateOf(i.balance, i.stock_out)
+        : counting ? "uncounted"
+        : stateOf(i.remaining, i.stock_out);
+      i.outlier = i.stock_in >= OUTLIER_THRESHOLD ||
+        (i.balance !== null && i.balance >= OUTLIER_THRESHOLD);
+    });
+
+    const tally = (state) => data.items.filter((i) => i.status === state).length;
+    data.kpi.negative_count = tally("negative");
+    data.kpi.out_of_stock_count = tally("out_of_stock");
+    data.kpi.uncounted_count = tally("uncounted");
+    data.kpi.outlier_count = data.items.filter((i) => i.outlier).length;
+    // Movement is a fact of the period, not a state of the shelf: an item
+    // that shipped and then ran out still moved.
+    data.kpi.moving_count = data.items.filter((i) => i.stock_out > 0).length;
   }
 
   // Writing DATA back out drops the derived views — they are rebuilt on load,
@@ -1356,9 +1404,20 @@
     `(${meta.days_in_period} trading ${meta.days_in_period === 1 ? "day" : "days"}). ` +
     `Opening balances carried from ${meta.opening_label}.`;
 
+  /* Whether the figures on this page are counted stock or ledger arithmetic.
+     Everything that reports a quantity reads it, so the page says the same
+     thing throughout about where its numbers come from. */
+  const counting = !!(DATA.on_hand && DATA.on_hand.file && !DATA.on_hand.error);
+  const countSheet = counting ? `"${DATA.on_hand.sheet}"` : "the ledger";
+
   const flags = [];
   if (kpi.negative_count) {
     flags.push(`<strong>${kpi.negative_count} SKUs hold a negative balance</strong> — more was issued than the ledger says was ever received.`);
+  }
+  if (counting && kpi.uncounted_count) {
+    flags.push(`<strong>${int(kpi.uncounted_count)} of ${int(kpi.sku_count)} SKUs have no line on the ` +
+      `"${DATA.on_hand.sheet}" sheet</strong>, so no quantity is shown for them. ` +
+      `Quantities come from that sheet, not from the ledger's running balance.`);
   }
   if (kpi.outlier_count) {
     flags.push(`<strong>${kpi.outlier_count} SKUs are booked in a different unit from the one they ship in</strong>, which inflates their receipts by a factor of a thousand or more. They are excluded from the totals below and listed under Stock health.`);
@@ -1402,13 +1461,13 @@
     {
       label: "Negative balances",
       value: int(kpi.negative_count),
-      sub: "issued more than received",
+      sub: counting ? `on the ${countSheet} count` : "issued more than received",
       dot: "critical"
     },
     {
       label: "Zero on hand",
       value: int(kpi.out_of_stock_count),
-      sub: "nothing left to issue",
+      sub: counting ? "counted, nothing on the shelf" : "nothing left to issue",
       dot: "warning"
     },
     {
@@ -1539,8 +1598,13 @@
   $("movement-sub").textContent =
     `${kpi.moving_count} of ${int(kpi.sku_count)} SKUs recorded an outbound movement in ${periodName}, ` +
     `totalling ${int(kpi.out_total)} units.`;
-  $("sub-movers").textContent =
-    "The ten SKUs with the largest issued quantity. Hover a bar for the balance it left behind.";
+  $("sub-movers").textContent = counting
+    ? "The ten SKUs with the largest issued quantity. Hover a bar for what the " +
+      "count found still on the shelf."
+    : "The ten SKUs with the largest issued quantity. Hover a bar for the balance it left behind.";
+
+  const onHandOf = (m) => (m.balance === null ? "—" : int(m.balance));
+  const onHandLabel = counting ? "On hand" : "Remaining";
 
   barChart($("chart-movers"), {
     rows: DATA.top_movers.map((m) => ({
@@ -1549,7 +1613,7 @@
       tipName: `${m.code} · ${m.description}`,
       tipRows: [
         ["Issued", int(m.stock_out) + " " + (m.uom || "units")],
-        ["Remaining", int(m.remaining)],
+        [onHandLabel, onHandOf(m)],
         ["Pack size", m.size || "—"]
       ]
     })),
@@ -1562,7 +1626,7 @@
     { label: "Code", get: (m) => m.code },
     { label: "Description", wide: true, get: (m) => m.description },
     { label: "Issued", num: true, get: (m) => int(m.stock_out) },
-    { label: "Remaining", num: true, get: (m) => int(m.remaining) },
+    { label: onHandLabel, num: true, get: onHandOf },
     { label: "UoM", get: (m) => m.uom || "—" }
   ], DATA.top_movers);
 
@@ -1571,15 +1635,31 @@
    * ------------------------------------------------------------------ */
 
   const states = [
-    { key: "negative", label: "Negative balance", dot: "critical", note: "issued more than the ledger received" },
-    { key: "out_of_stock", label: "Zero on hand", dot: "warning", note: "nothing left to issue" },
+    { key: "negative", label: "Negative balance", dot: "critical",
+      note: counting ? "counted below zero" : "issued more than the ledger received" },
+    { key: "out_of_stock", label: "Zero on hand", dot: "warning",
+      note: counting ? "counted, nothing on the shelf" : "nothing left to issue" },
     { key: "moving", label: "Moved this period", dot: "good", note: "stock on hand and turning" },
     { key: "idle", label: "Idle", dot: null, note: "stock on hand, no movement recorded" }
   ];
+  if (counting) {
+    states.push({ key: "uncounted", label: "Not on the count sheet", dot: "serious",
+                  note: `no line on ${countSheet}, so no quantity is shown` });
+  }
   const counts = {};
   DATA.items.forEach((i) => { counts[i.status] = (counts[i.status] || 0) + 1; });
 
-  $("sub-health").textContent = `All ${int(kpi.sku_count)} SKUs in the ledger.`;
+  $("health-head-sub").textContent = counting
+    ? `Every SKU falls into exactly one state, read off the count sheet: counted ` +
+      `below zero, counted at zero, counted with stock and moved this period, ` +
+      `counted with stock and idle, or not on the count sheet at all.`
+    : `Every SKU falls into exactly one state, checked in order: negative, then ` +
+      `zero, then moved this period, then idle.`;
+
+  $("sub-health").textContent = counting
+    ? `All ${int(kpi.sku_count)} SKUs, by what ${DATA.on_hand.file} counted on its ` +
+      `${countSheet} sheet — not by the ledger's running balance.`
+    : `All ${int(kpi.sku_count)} SKUs in the ledger.`;
 
   // A four-row list rather than a table: the card is half-width, and a table
   // here would only scroll the share column out of sight.
@@ -1612,18 +1692,39 @@
     healthHost.appendChild(row);
   });
 
+  /* Once the count report is in hand this card usually has nothing to show:
+     a physical count does not go below zero. The question that is left is the
+     other way round — which SKUs the count sheet has no line for at all — so
+     the card answers that instead rather than standing empty. */
   const negatives = DATA.negative_stock;
-  $("sub-negative").textContent =
-    `${negatives.length} SKUs, deepest first. A negative closing balance means issues were booked against stock the ledger never recorded receiving.`;
-
   // Kept to four columns so the balance — the point of the table — stays visible
   // in a half-width card. Opening and received are in the full ledger below.
-  renderTable($("tbl-negative"), [
+  const shortCols = (last, read) => [
     { label: "Code", get: (i) => i.code },
     { label: "Description", wide: true, get: (i) => i.description },
     { label: "Issued", num: true, get: (i) => int(i.stock_out) },
-    { label: "Balance", num: true, get: (i) => int(i.remaining) }
-  ], negatives);
+    { label: last, num: true, get: read }
+  ];
+
+  if (negatives.length || !counting) {
+    $("title-negative").textContent = "Deepest negative balances";
+    $("sub-negative").textContent = negatives.length
+      ? `${negatives.length} SKUs, deepest first. A negative balance means issues were ` +
+        `booked against stock that was never recorded as received.`
+      : `No SKU holds a negative balance.`;
+    renderTable($("tbl-negative"),
+                shortCols("Balance", (i) => int(i.balance)), negatives);
+  } else {
+    const missing = DATA.uncounted_stock;
+    $("title-negative").textContent = "Not on the count sheet";
+    $("sub-negative").textContent =
+      `${DATA.on_hand.file} counts ${int(DATA.on_hand.matched)} of ` +
+      `${int(kpi.sku_count)} SKUs and finds none of them short. These ` +
+      `${missing.length} have no line on it, so this page shows no quantity ` +
+      `for them; what the ledger last had them at is beside each, lowest first.`;
+    renderTable($("tbl-negative"),
+                shortCols("Ledger", (i) => int(i.remaining)), missing);
+  }
 
   const outliers = DATA.outliers;
   $("sub-outliers").textContent =
@@ -1635,8 +1736,11 @@
     { label: "Description", wide: true, get: (i) => i.description },
     { label: "Pack size", get: (i) => i.size || "—" },
     { label: "Received", num: true, get: (i) => int(i.stock_in) },
-    { label: "Balance", num: true, get: (i) => int(i.remaining) },
-    { label: "Issued", num: true, get: (i) => int(i.stock_out) }
+    { label: "Issued", num: true, get: (i) => int(i.stock_out) },
+    // Set beside the receipt figure the counted quantity makes the case on
+    // its own: half a billion units received, nine thousand on the shelf.
+    { label: counting ? "On hand" : "Balance", num: true,
+      get: (i) => (i.balance === null ? "—" : int(i.balance)) }
   ], outliers);
 
   /* ------------------------------------------------------------------ *
@@ -2386,8 +2490,24 @@
     negative: ["Negative", "critical"],
     out_of_stock: ["Zero", "warning"],
     moving: ["Moved", "good"],
-    idle: ["Idle", null]
+    idle: ["Idle", null],
+    uncounted: ["Not counted", "serious"]
   };
+
+  // The filter only exists where there is a count sheet to be missing from.
+  $("chip-uncounted").hidden = !counting;
+  if (!counting && filter === "uncounted") {
+    filter = "all";
+    document.querySelectorAll(".chip[data-filter]").forEach((c) =>
+      c.setAttribute("aria-pressed", String(c.dataset.filter === "all")));
+  }
+
+  $("inventory-head-sub").textContent = counting
+    ? `Movements for every SKU from ${DATA.meta.source_file}, with what ` +
+      `${DATA.on_hand.file} counted on hand beside them. Search by code or ` +
+      `description; click a column to sort.`
+    : `Opening balance, movements and closing balance for every SKU. Search by ` +
+      `code or description; click a column to sort.`;
 
   const invCols = [
     { key: "code", label: "Code", get: (i) => i.code },
@@ -2397,7 +2517,12 @@
     { key: "opening", label: "Opening", num: true, get: (i) => int(i.opening) },
     { key: "stock_in", label: "Received", num: true, get: (i) => int(i.stock_in) },
     { key: "stock_out", label: "Issued", num: true, get: (i) => int(i.stock_out) },
-    { key: "remaining", label: "Balance", num: true, get: (i) => int(i.remaining) },
+    /* What is actually on the shelf, off the count report — not the ledger's
+       closing balance, which is opening plus movements and goes below zero
+       wherever a receipt was missed. A SKU the count has no line for shows a
+       dash rather than a number nobody has verified. */
+    { key: "balance", label: counting ? "On hand" : "Balance", num: true,
+      get: (i) => (i.balance === null ? "—" : int(i.balance)) },
     {
       key: "status", label: "State", get: (i) => {
         const [text, dot] = STATUS_LABEL[i.status];
@@ -2420,7 +2545,10 @@
         i.code.toLowerCase().includes(q) ||
         i.description.toLowerCase().includes(q))
       .sort((a, b) => {
-        const x = a[sortKey], y = b[sortKey];
+        // A SKU with no line on the count sheet has no quantity to compare, so
+        // it sorts below every number rather than between "null" and "9".
+        const x = a[sortKey] ?? (sortKey === "balance" ? -Infinity : null);
+        const y = b[sortKey] ?? (sortKey === "balance" ? -Infinity : null);
         if (typeof x === "number" && typeof y === "number") return (x - y) * sortDir;
         return String(x ?? "").localeCompare(String(y ?? "")) * sortDir;
       });
@@ -2502,7 +2630,6 @@
    * ------------------------------------------------------------------ */
 
   const ZIP_EOCD = 0x06054b50, ZIP_CD = 0x02014b50, ZIP_LOCAL = 0x04034b50;
-  const OUTLIER_THRESHOLD = 5000000;
 
   async function unzip(buffer) {
     const dv = new DataView(buffer);
